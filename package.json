@@ -1,0 +1,10 @@
+{
+  "name": "tiktok-relay",
+  "version": "1.0.0",
+  "description": "TikTok video download relay service for Zeabur",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {}
+}
