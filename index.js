@@ -192,29 +192,39 @@ function writeJson(res, code, data) {
   res.end(JSON.stringify(data))
 }
 
-// ---- Debug endpoint ----
-function debugFetch(targetUrl, res) {
+// ---- Debug endpoint (follows redirects) ----
+function debugFetch(targetUrl, res, depth) {
+  if (!depth) depth = 0
+  if (depth > 5) return writeJson(res, 502, { error: 'too many redirects' })
   try {
     const p = urlMod.parse(targetUrl)
-    const r = https.get({
+    const mod = p.protocol === 'http:' ? http : https
+    const r = mod.get({
       hostname: p.hostname, path: p.path + (p.search || ''),
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
       timeout: 20000, rejectUnauthorized: false
     }, (r2) => {
+      const loc = r2.headers.location
+      if ([301, 302, 303, 307, 308].includes(r2.statusCode) && loc) {
+        r2.resume()
+        return debugFetch(loc.startsWith('http') ? loc : 'https://' + p.hostname + loc, res, depth + 1)
+      }
       let d = ''
       r2.on('data', c => d += c)
       r2.on('end', () => {
         const ogv = d.match(/<meta[^>]+property="og:video"[^>]+content="([^"]+)"[^>]*>/i) ||
                     d.match(/<meta[^>]+content="([^"]+)"[^>]+property="og:video"[^>]*>/i)
+        const isJson = r2.headers['content-type']?.includes('json')
         writeJson(res, 200, {
           status: r2.statusCode,
+          contentType: r2.headers['content-type'] || null,
           length: d.length,
           hasOgVideo: !!ogv,
           ogVideo: ogv ? ogv[1] : null,
-          hasVideoTag: d.includes('<video'),
-          lastModified: r2.headers['last-modified'] || null,
-          hasIframe: d.includes('<iframe'),
-          sample: d.substring(0, 4000)
+          hasVideoTag: !isJson && d.includes('<video'),
+          isJson,
+          jsonKeys: isJson ? Object.keys(JSON.parse(d)).slice(0, 30) : null,
+          sample: isJson ? d.substring(0, 2000) : d.substring(0, 4000)
         })
       })
     })
