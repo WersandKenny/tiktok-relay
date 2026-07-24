@@ -72,8 +72,28 @@ function igParseAndDownload(pageUrl, cb) {
     cb('all failed: ' + tried.join(', '))
   }
 
-  // Strategy 1: ddinstagram.com (SSR-rendered proxy)
-  fetchHTML('https://www.ddinstagram.com/p/' + sc + '/', (err, html) => {
+  // Strategy 1: imginn.com (SSR-rendered Instagram proxy, commonly active)
+  fetchHTML('https://imginn.com/p/' + sc + '/', (err, html) => {
+    if (err) { tried.push('imginn:' + err); return tryDdIg(sc, info, tried, done) }
+    const vidSrc = html.match(/<source[^>]+src="([^"]+\.mp4[^"]*)"[^>]*>/i) ||
+                   html.match(/<video[^>]+src="([^"]+)"[^>]*>/i) ||
+                   html.match(/data-video="([^"]+)"/i) ||
+                   html.match(/data-url="([^"]+\.mp4[^"]*)"/i)
+    if (vidSrc) {
+      const title = (html.match(/<meta[^>]+property="og:title"[^>]+content="([^"]+)"[^>]*>/i) || [])[1] || ''
+      info.title = title
+      return downloadStream(vidSrc[1].replace(/^http:/, 'https:'), (e, s) => done(e, s, info))
+    }
+    const ogv = html.match(/<meta[^>]+property="og:video"[^>]+content="([^"]+)"[^>]*>/i) ||
+                html.match(/<meta[^>]+content="([^"]+)"[^>]+property="og:video"[^>]*>/i)
+    if (ogv) return downloadStream(ogv[1].replace(/^http:/, 'https:'), (e, s) => done(e, s, info))
+    tried.push('imginn:no_video')
+    tryDdIg(sc, info, tried, done)
+  })
+}
+
+function tryDdIg(sc, info, tried, done) {
+  fetchHTML('https://ddinstagram.com/p/' + sc + '/', (err, html) => {
     if (err) { tried.push('dd:' + err); return tryGraphql(sc, info, done) }
     const ogv = html.match(/<meta[^>]+property="og:video"[^>]+content="([^"]+)"[^>]*>/i) ||
                 html.match(/<meta[^>]+content="([^"]+)"[^>]+property="og:video"[^>]*>/i)
