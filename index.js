@@ -7,47 +7,12 @@ const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS')
   res.setHeader('Access-Control-Allow-Headers', '*')
   if (req.method === 'OPTIONS') return res.end()
-
-  // Health check
-  if (req.url === '/') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ status: 'ok', pid: process.pid, node: process.version })) }
-
-  // 调试：查看 Instagram 页面原始内容
-  if (req.url?.startsWith('/debug-ig?url=')) {
-    const dbgUrl = decodeURIComponent(req.url.replace('/debug-ig?url=', ''))
-    const m = dbgUrl.match(/instagram\.com\/(p|reel|reels|tv)\/([^/?]+)/)
-    const sc = m ? m[2] : ''
-    if (!sc) return sendJson(res, 400, { error: 'bad url' })
-    const path = '/p/' + sc + '/embed/'
-    https.get({
-      hostname: 'www.instagram.com', path,
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
-      timeout: 15000, rejectUnauthorized: false
-    }, (r2) => {
-      let h = ''
-      r2.on('data', c => h += c)
-      r2.on('end', () => {
-        const hasOgVideo = h.includes('og:video')
-        const hasVideoTag = h.includes('<video')
-        const hasVideoVersions = h.includes('video_versions')
-        const hasJSONLD = h.includes('ld+json')
-        const sample = h.length > 5000 ? h.substring(0, 5000) : h
-        sendJson(res, 200, {
-          htmlLength: h.length, hasOgVideo, hasVideoTag, hasVideoVersions, hasJSONLD,
-          statusCode: r2.statusCode,
-          sample: sample.substring(0, 3000)
-        })
-      })
-    }).on('error', e => sendJson(res, 500, { error: e.message }))
-    return
-  }
-
+  if (req.url === '/') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ status: 'ok' })) }
   if (req.method === 'POST' && req.url === '/download') return handleDownload(req, res)
   if (req.method === 'POST' && req.url === '/ig-download') return handleIgDownload(req, res)
-
   res.writeHead(404); res.end('not found')
 }).on('error', e => console.error('server error:', e))
 
-// TikTok relay
 function handleDownload(req, res) {
   let body = ''
   req.on('data', c => body += c)
@@ -66,7 +31,6 @@ function handleDownload(req, res) {
   })
 }
 
-// Instagram parse + download
 function handleIgDownload(req, res) {
   let body = ''
   req.on('data', c => body += c)
@@ -90,16 +54,29 @@ function handleIgDownload(req, res) {
 
 function igParseAndDownload(pageUrl, cb) {
   const m = pageUrl.match(/instagram\.com\/(p|reel|reels|tv)\/([^/?]+)/)
-  const shortcode = m ? m[2] : ''
-  if (!shortcode) return cb('invalid url')
+  const sc = m ? m[2] : ''
+  if (!sc) return cb('invalid url')
   let info = {}
+  tryDdIg(sc, info, cb)
+}
 
-  tryGraphql(shortcode, info, cb)
+function tryDdIg(sc, info, cb) {
+  igFetchHTML('https://www.ddinstagram.com/p/' + sc + '/', (err, html) => {
+    if (err) return tryGraphql(sc, info, cb)
+    const ogv = html.match(/<meta[^>]+property="og:video"[^>]+content="([^"]+)"[^>]*>/i)
+      || html.match(/<meta[^>]+content="([^"]+)"[^>]+property="og:video"[^>]*>/i)
+    if (ogv) {
+      info.title = html.match(/<meta[^>]+property="og:title"[^>]+content="([^"]+)"[^>]*>/i)?.[1] || ''
+      info.author = html.match(/<meta[^>]+property="og:description"[^>]+content="([^"]+)"[^>]*>/i)?.[1] || ''
+      return downloadStream(ogv[1].replace(/^http:/,'https:'), (e, s) => cb(e, s, info))
+    }
+    tryGraphql(sc, info, cb)
+  })
 }
 
 function tryGraphql(sc, info, cb) {
-  igFetchJSON('/p/' + sc + '/?__a=1&__d=1', (err, data) => {
-    if (err) return tryOembed(sc, info, cb)
+  igFetchJSON('/p/' + sc + '/?__a=1', (err, data) => {
+    if (err) return cb('could not extract video URL')
     try {
       const item = data?.items?.[0] || data?.graphql?.shortcode_media || data?.item || {}
       if (item.video_versions?.length) {
@@ -116,62 +93,10 @@ function tryGraphql(sc, info, cb) {
         }
       }
     } catch(e) {}
-    tryOembed(sc, info, cb)
+    cb('no video in this post')
   })
 }
 
-function tryOembed(sc, info, cb) {
-  igFetchOembed(sc, (err, oembed) => {
-    if (err) return tryEmbedIframe(sc, info, cb)
-    info.title = oembed.title || ''
-    info.author = oembed.author_name || ''
-    const iframeSrc = (oembed.html || '').match(/src="([^"]+)"/)?.[1]
-    if (iframeSrc) {
-      const iframeUrl = iframeSrc.startsWith('//') ? 'https:' + iframeSrc : iframeSrc
-      return tryEmbedVideo(iframeUrl, info, cb)
-    }
-    tryEmbedIframe(sc, info, cb)
-  })
-}
-
-function tryEmbedVideo(iframeUrl, info, cb) {
-  igFetchHTML(iframeUrl, (err, html) => {
-    if (err) return cb(err)
-    const ogv = html.match(/<meta[^>]+property="og:video"[^>]+content="([^"]+)"[^>]*>/i)
-      || html.match(/<meta[^>]+content="([^"]+)"[^>]+property="og:video"[^>]*>/i)
-    if (ogv) return downloadStream(ogv[1].replace(/^http:/,'https:'), (e, s) => cb(e, s, info))
-    const vt = html.match(/<video[^>]+src="([^"]+)"[^>]*>/i)
-    if (vt) return downloadStream(vt[1].replace(/^http:/,'https:'), (e, s) => cb(e, s, info))
-    cb('no video in embed page')
-  })
-}
-
-function tryEmbedIframe(sc, info, cb) {
-  igFetchHTML('https://www.instagram.com/p/' + sc + '/embed/', (err, html) => {
-    if (err) return tryPage(sc, info, cb)
-    const ogv = html.match(/<meta[^>]+property="og:video"[^>]+content="([^"]+)"[^>]*>/i)
-      || html.match(/<meta[^>]+content="([^"]+)"[^>]+property="og:video"[^>]*>/i)
-    if (ogv) return downloadStream(ogv[1].replace(/^http:/,'https:'), (e, s) => cb(e, s, info))
-    const vt = html.match(/<video[^>]+src="([^"]+)"[^>]*>/i)
-    if (vt) return downloadStream(vt[1].replace(/^http:/,'https:'), (e, s) => cb(e, s, info))
-    const vi = html.match(/"video_versions":\[([\s\S]*?)\]/)
-    if (vi) { try { const a = JSON.parse('[' + vi[1] + ']'); if (a[0]?.url) return downloadStream(a.sort((x,y)=>y.width-x.width)[0].url.replace(/^http:/,'https:'), (e, s) => cb(e, s, info)) } catch(e) {} }
-    tryPage(sc, info, cb)
-  })
-}
-
-function tryPage(sc, info, cb) {
-  igFetchHTML('https://www.instagram.com/p/' + sc + '/', (err, html) => {
-    if (err) return cb(err)
-    const vi = html.match(/"video_versions":\[([\s\S]*?)\]/)
-    if (vi) { try { const a = JSON.parse('[' + vi[1] + ']'); if (a[0]?.url) return downloadStream(a.sort((x,y)=>y.width-x.width)[0].url.replace(/^http:/,'https:'), (e, s) => cb(e, s, info)) } catch(e) {} }
-    const ld = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/)
-    if (ld) { try { const j = JSON.parse(ld[1]); if (j.video?.contentUrl) return downloadStream(j.video.contentUrl.replace(/^http:/,'https:'), (e, s) => cb(e, s, info)) } catch(e) {} }
-    cb('could not extract video URL')
-  })
-}
-
-// HTTP helpers
 function igFetchJSON(path, cb) {
   const r = https.get({ hostname: 'www.instagram.com', path, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }, timeout: 15000, rejectUnauthorized: false }, (res) => {
     let d = ''
@@ -194,17 +119,6 @@ function igFetchHTML(fullUrl, cb) {
     })
     r.on('error', cb); r.on('timeout', function() { r.destroy(); cb('timeout') })
   } catch(e) { cb(e.message) }
-}
-
-function igFetchOembed(sc, cb) {
-  const r = https.get({ hostname: 'api.instagram.com', path: '/oembed?url=https://www.instagram.com/p/' + sc + '/&format=json', headers: { 'User-Agent': 'Mozilla/5.0' }, timeout: 15000, rejectUnauthorized: false }, (res) => {
-    let d = ''
-    res.on('data', c => d += c)
-    res.on('end', () => {
-      try { cb(null, JSON.parse(d)) } catch (e) { cb(e.message) }
-    })
-  })
-  r.on('error', cb); r.on('timeout', function() { r.destroy(); cb('timeout') })
 }
 
 function downloadStream(url, cb) { redirectDownload(url, 0, cb) }
