@@ -107,127 +107,140 @@ function handleIgDownload(req, res) {
 }
 
 function parseIgVideoUrl(pageUrl, cb) {
-  // 规范化 URL：兼容 /p/、/reel/、/reels/、/tv/
-  const cleanUrl = pageUrl.replace(/\/\?.*$/, '').split('?')[0]
+  // 提取 shortcode
+  const sc = pageUrl.match(/instagram\.com\/(p|reel|reels|tv)\/([^/?]+)/)
+  const shortcode = sc ? sc[2] : ''
+  if (!shortcode) return cb('invalid Instagram URL')
 
-  fetchPage(cleanUrl, (err, html) => {
-    if (err) return cb(err)
+  let info = {}
+  let videoUrl = null
+  let attempts = 0
+  const MAX_ATTEMPTS = 5
 
-    let videoUrl = null
-    let info = {}
+  // 策略1: oEmbed API 获取 embed HTML
+  function tryOEmbed() {
+    attempts++
+    https.get({
+      hostname: 'api.instagram.com',
+      path: '/oembed?url=https://www.instagram.com/p/' + shortcode + '/&format=json',
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+      timeout: 15000, rejectUnauthorized: false
+    }, (res) => {
+      let d = ''
+      res.on('data', c => d += c)
+      res.on('end', () => {
+        try {
+          const oembed = JSON.parse(d)
+          info.title = oembed.title || ''
+          info.author = oembed.author_name || ''
+        } catch (e) {}
+        tryGraphql()
+      })
+    }).on('error', () => tryGraphql()).on('timeout', function () { tryGraphql() })
+  }
 
-    // 方法1: 从 JSON-LD script 标签提取
-    const ldMatch = html.match(/<script type="application\/ld\+json">([\s\S]*?)<\/script>/)
-    if (ldMatch) {
-      try {
-        const ld = JSON.parse(ldMatch[1])
-        if (ld.video) {
-          videoUrl = ld.video.contentUrl || ld.video.embedUrl || null
-          info.title = ld.video.name || ld.video.description || ''
-          info.author = ld.video.author?.name || ''
+  const USER_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Cookie': 'ig_did=60B7B4F2-8A3C-4B1E-9D5F-2A1C3E5F7G9H'
+  }
+
+  // 策略2: public graphql API (?__a=1)
+  function tryGraphql() {
+    if (attempts > MAX_ATTEMPTS) return done()
+    attempts++
+    https.get({
+      hostname: 'www.instagram.com',
+      path: '/p/' + shortcode + '/?__a=1&__d=1',
+      headers: USER_HEADERS,
+      timeout: 15000, rejectUnauthorized: false
+    }, (res) => {
+      if ([301,302].includes(res.statusCode)) { res.resume(); return tryEmbedPage() }
+      let d = ''
+      res.on('data', c => d += c)
+      res.on('end', () => {
+        try {
+          const json = JSON.parse(d)
+          const item = json?.items?.[0] || json?.graphql?.shortcode_media || json?.item || {}
+          if (item.video_versions?.length) {
+            videoUrl = item.video_versions.sort((a,b)=>b.width-a.width)[0].url
+            info.title = item.caption?.text || item.accessibility_caption || info.title
+            info.author = item.owner?.username || item.user?.username || info.author
+            return done()
+          }
+          // carousel
+          const edges = item.edge_sidecar_to_children?.edges || item.carousel_media || []
+          for (const e of edges) {
+            const node = e.node || e
+            if (node.video_versions?.length) {
+              videoUrl = node.video_versions.sort((a,b)=>b.width-a.width)[0].url
+              return done()
+            }
+          }
+        } catch (e) {}
+        tryEmbedPage()
+      })
+    }).on('error', () => tryEmbedPage()).on('timeout', function () { tryEmbedPage() })
+  }
+
+  // 策略3: embed 页面提取 og:video
+  function tryEmbedPage() {
+    if (attempts > MAX_ATTEMPTS) return done()
+    attempts++
+    https.get({
+      hostname: 'www.instagram.com',
+      path: '/p/' + shortcode + '/embed/',
+      headers: USER_HEADERS,
+      timeout: 15000, rejectUnauthorized: false
+    }, (res) => {
+      if ([301,302,303].includes(res.statusCode)) { res.resume(); return done() }
+      let html = ''
+      res.on('data', c => html += c)
+      res.on('end', () => {
+        const ogv = html.match(/<meta[^>]+property="og:video"[^>]+content="([^"]+)"[^>]*>/i) ||
+                    html.match(/<meta[^>]+content="([^"]+)"[^>]+property="og:video"[^>]*>/i)
+        if (ogv) { videoUrl = ogv[1]; return done() }
+        const vt = html.match(/<video[^>]+src="([^"]+)"[^>]*>/i)
+        if (vt) { videoUrl = vt[1]; return done() }
+        // 尝试从 window.__INITIAL_STATE__ 提取
+        const ir = html.match(/window\.__INITIAL_STATE__\s*=\s*({[\s\S]*?});/i)
+        if (ir) {
+          try {
+            const s = JSON.parse(ir[1])
+            const items = s?.items || s?.media?._items || []
+            for (const item of items) {
+              if (item.video_versions?.length) { videoUrl = item.video_versions.sort((a,b)=>b.width-a.width)[0].url; return done() }
+              for (const ci of (item.carousel_media || [])) { if (ci.video_versions?.length) { videoUrl = ci.video_versions[0].url; return done() } }
+            }
+          } catch(e) {}
         }
-      } catch (e) {}
-    }
-
-    // 方法2: 从 window.__INITIAL_STATE__ 提取
-    if (!videoUrl) {
-      const irMatch = html.match(/window\.__INITIAL_STATE__\s*=\s*({[\s\S]*?});\s*<\/script>/)
-      if (irMatch) {
-        try {
-          const state = JSON.parse(irMatch[1])
-          const items = state?.items || state?.feed?.items || state?.media?.items || []
-          for (const item of items) {
-            const versions = item?.video_versions || []
-            if (versions.length > 0) {
-              videoUrl = versions.sort((a, b) => (b.width || 0) - (a.width || 0))[0].url
-              info.title = item?.caption?.text || ''
-              info.author = item?.user?.username || ''
-              break
-            }
-            // carousel
-            const carousel = item?.carousel_media || []
-            for (const ci of carousel) {
-              if (ci.media_type === 2) {
-                const cv = ci.video_versions || []
-                if (cv.length > 0) { videoUrl = cv[0].url; break }
-              }
-            }
-            if (videoUrl) break
+        // 直接在 HTML 搜索 video_versions JSON
+        const vvMatch = html.match(/"video_versions":\[([\s\S]*?)\],"([^"]+?)":/g)
+        if (vvMatch) {
+          for (const m of vvMatch) {
+            try {
+              const arr = JSON.parse(m.match(/:(\[.*\])/)[1])
+              if (arr[0]?.url) { videoUrl = arr.sort((a,b)=>b.width-a.width)[0].url; return done() }
+            } catch(e) {}
           }
-          // 有时在短路径下
-          if (!videoUrl && state?.media?.video_versions) {
-            videoUrl = state.media.video_versions.sort((a, b) => (b.width || 0) - (a.width || 0))[0].url
-          }
-        } catch (e) {}
-      }
-    }
+        }
+        done()
+      })
+    }).on('error', () => done()).on('timeout', function () { done() })
+  }
 
-    // 方法3: 从 __NEXT_DATA__ (新版Instagram页面)
-    if (!videoUrl) {
-      const ndMatch = html.match(/<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/)
-      if (ndMatch) {
-        try {
-          const next = JSON.parse(ndMatch[1])
-          const pageProps = next?.props?.pageProps || {}
-          const media = pageProps?.media || pageProps?.postInfo || {}
-          const vv = media?.video_versions || []
-          if (vv.length > 0) {
-            videoUrl = vv.sort((a, b) => (b.width || 0) - (a.width || 0))[0].url
-            info.title = media?.caption?.text || ''
-            info.author = media?.user?.username || ''
-          }
-        } catch (e) {}
-      }
-    }
-
-    // 方法4: 直接从 HTML 中搜索 video_url / video_versions 原始 JSON
-    if (!videoUrl) {
-      const jsonMatches = html.matchAll(/"video_versions":\[([\s\S]*?)\],"([^"]+?)":/g)
-      for (const match of jsonMatches) {
-        try {
-          const arr = JSON.parse('[' + match[1] + ']')
-          if (arr.length > 0 && arr[0].url) {
-            videoUrl = arr.sort((a, b) => (b.width || 0) - (a.width || 0))[0].url
-            break
-          }
-        } catch (e) {}
-      }
-    }
-
+  function done() {
     if (videoUrl) {
       videoUrl = videoUrl.replace(/^http:/, 'https:')
       cb(null, videoUrl, info)
     } else {
-      cb('could not extract video URL from page')
+      cb('could not extract video URL')
     }
-  })
-}
-
-function fetchPage(url, cb) {
-  const p = urlMod.parse(url)
-  // 确保是 instagram.com
-  const opts = {
-    hostname: 'www.instagram.com',
-    path: p.path + (p.search || ''),
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Cookie': 'ig_did=60B7B4F2-8A3C-4B1E-9D5F-2A1C3E5F7G9H; ig_nrcb=1; mid=Z_X0QAALAAF0Y1cYxp48LqLxFmRp'
-    },
-    timeout: 20000,
-    rejectUnauthorized: false
   }
-  https.get(opts, (res) => {
-    // 处理重定向
-    if ([301, 302, 303].includes(res.statusCode) && res.headers.location) {
-      res.resume()
-      return cb('redirect: ' + res.headers.location)
-    }
-    let html = ''
-    res.on('data', c => html += c)
-    res.on('end', () => cb(null, html))
-  }).on('error', cb).on('timeout', function () { cb('timeout') })
+
+  // 先试 oEmbed，因为我们已有 Railway 环境，可以访问 api.instagram.com
+  tryOEmbed()
 }
 
 // ========== 公共下载 ==========
