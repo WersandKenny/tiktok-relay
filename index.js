@@ -11,6 +11,36 @@ const server = http.createServer((req, res) => {
   // Health check
   if (req.url === '/') { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(JSON.stringify({ status: 'ok', pid: process.pid, node: process.version })) }
 
+  // 调试：查看 Instagram 页面原始内容
+  if (req.url?.startsWith('/debug-ig?url=')) {
+    const dbgUrl = decodeURIComponent(req.url.replace('/debug-ig?url=', ''))
+    const m = dbgUrl.match(/instagram\.com\/(p|reel|reels|tv)\/([^/?]+)/)
+    const sc = m ? m[2] : ''
+    if (!sc) return sendJson(res, 400, { error: 'bad url' })
+    const path = '/p/' + sc + '/embed/'
+    https.get({
+      hostname: 'www.instagram.com', path,
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+      timeout: 15000, rejectUnauthorized: false
+    }, (r2) => {
+      let h = ''
+      r2.on('data', c => h += c)
+      r2.on('end', () => {
+        const hasOgVideo = h.includes('og:video')
+        const hasVideoTag = h.includes('<video')
+        const hasVideoVersions = h.includes('video_versions')
+        const hasJSONLD = h.includes('ld+json')
+        const sample = h.length > 5000 ? h.substring(0, 5000) : h
+        sendJson(res, 200, {
+          htmlLength: h.length, hasOgVideo, hasVideoTag, hasVideoVersions, hasJSONLD,
+          statusCode: r2.statusCode,
+          sample: sample.substring(0, 3000)
+        })
+      })
+    }).on('error', e => sendJson(res, 500, { error: e.message }))
+    return
+  }
+
   if (req.method === 'POST' && req.url === '/download') return handleDownload(req, res)
   if (req.method === 'POST' && req.url === '/ig-download') return handleIgDownload(req, res)
 
